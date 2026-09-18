@@ -1,131 +1,171 @@
-/*
-   ESP8266 - 4 Ultrasonic HC-SR04
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+#include <WiFiManager.h>
 
-   SENSOR 1
-   TRIG = GPIO 5
-   ECHO = GPIO 4
+// =====================================================
+// KONFIGURASI API LARAVEL
+// =====================================================
+String apiUrl = "http://bin.ihi.my.id/api/servo/status";
 
-   SENSOR 2
-   TRIG = GPIO 14
-   ECHO = GPIO 12
+// =====================================================
+// PIN SERVO & VARIABEL
+// =====================================================
+#define SERVO1_PIN 26   // D26
+#define SERVO2_PIN 25   // D27
 
-   SENSOR 3
-   TRIG = GPIO 13
-   ECHO = GPIO 16
+Servo servo1;
+Servo servo2;
 
-   SENSOR 4
-   TRIG = GPIO 0
-   ECHO = GPIO 2
-*/
+int currentAngle1 = -1;
+int currentAngle2 = -1;
 
-#define TRIG1 5
-#define ECHO1 4
+unsigned long lastPollTime = 0;
+const unsigned long pollInterval = 1500;
 
-#define TRIG2 14
-#define ECHO2 12
+// =====================================================
+// FUNGSI KONEKSI WIFI & WIFIMANAGER
+// =====================================================
+void setup_wifi() {
+    Serial.println();
+    Serial.println("Memulai WiFiManager...");
 
-#define TRIG3 13
-#define ECHO3 16
+    // Cek apakah belum ada WiFi yang tersimpan sebelumnya di memori
+    if (WiFi.SSID() == "") {
+        Serial.println("Tidak ada riwayat WiFi. Mencoba koneksi bawaan (Default): Yoimo");
+        WiFi.begin("Yoimo", "12344321");
+        
+        int retries = 0;
+        // Tunggu maksimal sekitar 7.5 detik
+        while (WiFi.status() != WL_CONNECTED && retries < 15) {
+            delay(500);
+            Serial.print(".");
+            retries++;
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nBerhasil terhubung ke WiFi Bawaan (Yoimo)!");
+        } else {
+            Serial.println("\nGagal terhubung ke WiFi Bawaan.");
+        }
+    }
 
-#define TRIG4 0
-#define ECHO4 2
+    // Jalankan WiFiManager
+    // Ini akan otomatis mencoba menyambung ke WiFi terakhir (entah itu Yoimo, atau yang baru)
+    // Jika semua gagal, baru dia akan memancarkan sinyal WiFi bernama "ESPSERVO"
+    WiFiManager wm;
+    bool res = wm.autoConnect("ESPSERVO");
 
-
-float bacaUltrasonik(int trigPin, int echoPin)
-{
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(3);
-
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-
-  digitalWrite(trigPin, LOW);
-
-  unsigned long durasi = pulseIn(echoPin, HIGH, 30000);
-
-  if (durasi == 0) {
-    return -1;
-  }
-
-  float jarak = durasi * 0.0343 / 2.0;
-
-  if (jarak > 400) {
-    return -1;
-  }
-
-  return jarak;
+    if (!res) {
+        Serial.println("Gagal terhubung dan kehabisan waktu, restart...");
+        delay(3000);
+        ESP.restart();
+    } 
+    else {
+        Serial.println("Berhasil Terhubung ke WiFi!");
+        Serial.print("SSID Saat Ini: ");
+        Serial.println(WiFi.SSID());
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+    }
 }
 
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+    Serial.begin(115200);
 
-void tampilkan(String nama, float jarak)
-{
-  Serial.print(nama);
-  Serial.print(": ");
+    // Setup Servo
+    servo1.setPeriodHertz(50);
+    servo1.attach(SERVO1_PIN, 500, 2400);
+    servo1.write(0);
 
-  if (jarak < 0) {
-    Serial.println("Tidak terbaca");
-  }
-  else {
-    Serial.print(jarak, 1);
-    Serial.println(" cm");
-  }
+    servo2.setPeriodHertz(50);
+    servo2.attach(SERVO2_PIN, 500, 2400);
+    servo2.write(0);
+
+    // Setup WiFi
+    setup_wifi();
 }
 
+// =====================================================
+// LOOP (POLLING)
+// =====================================================
+void loop() {
+    if (millis() - lastPollTime >= pollInterval) {
+        lastPollTime = millis();
 
-void setup()
-{
-  Serial.begin(115200);
+        if (WiFi.status() == WL_CONNECTED) {
+            HTTPClient http;
+            
+            http.begin(apiUrl);
+            int httpResponseCode = http.GET();
+            
+            if (httpResponseCode > 0) {
+                String payload = http.getString();
+                
+                // Parsing JSON (kapasitas diperbesar sedikit untuk menampung data WiFi baru)
+                StaticJsonDocument<300> doc;
+                DeserializationError error = deserializeJson(doc, payload);
+                
+                if (!error) {
+                    
+                    // 1. CEK PERINTAH GANTI WIFI (HYBRID MODE)
+                    if (doc.containsKey("new_wifi")) {
+                        const char* new_ssid = doc["new_wifi"]["ssid"];
+                        const char* new_pass = doc["new_wifi"]["password"];
+                        
+                        Serial.println("\n=================================");
+                        Serial.print("MENERIMA PERINTAH GANTI WIFI: ");
+                        Serial.println(new_ssid);
+                        Serial.println("Menyimpan pengaturan & Restart...");
+                        Serial.println("=================================\n");
+                        
+                        // Hapus memori WiFiManager & WiFi sistem
+                        WiFi.disconnect(true, true);
+                        delay(1000);
+                        
+                        // Simpan WiFi baru ke memori permanen ESP32
+                        WiFi.begin(new_ssid, new_pass);
+                        delay(2000); // Beri waktu untuk menyimpan
+                        
+                        // Restart ESP32 agar WiFiManager mengeksekusi koneksi baru
+                        ESP.restart();
+                    }
 
-  pinMode(TRIG1, OUTPUT);
-  pinMode(ECHO1, INPUT);
+                    // 2. KONTROL SERVO
+                    int targetAngle1 = doc["servo1"];
+                    int targetAngle2 = doc["servo2"];
+                    
+                    if (targetAngle1 != currentAngle1) {
+                        currentAngle1 = targetAngle1;
+                        int reverseAngle1 = 180 - currentAngle1; 
+                        servo1.write(reverseAngle1);
+                        Serial.print("Servo 1 -> ");
+                        Serial.println(reverseAngle1);
+                    }
 
-  pinMode(TRIG2, OUTPUT);
-  pinMode(ECHO2, INPUT);
-
-  pinMode(TRIG3, OUTPUT);
-  pinMode(ECHO3, INPUT);
-
-  pinMode(TRIG4, OUTPUT);
-  pinMode(ECHO4, INPUT);
-
-  digitalWrite(TRIG1, LOW);
-  digitalWrite(TRIG2, LOW);
-  digitalWrite(TRIG3, LOW);
-  digitalWrite(TRIG4, LOW);
-
-  delay(2000);
-
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println(" ESP8266 4 ULTRASONIC SENSOR");
-  Serial.println("==============================");
-}
-
-
-void loop()
-{
-  float sensor1 = bacaUltrasonik(TRIG1, ECHO1);
-
-  delay(60);
-
-  float sensor2 = bacaUltrasonik(TRIG2, ECHO2);
-
-  delay(60);
-
-  float sensor3 = bacaUltrasonik(TRIG3, ECHO3);
-
-  delay(60);
-
-  float sensor4 = bacaUltrasonik(TRIG4, ECHO4);
-
-  Serial.println("------------------------------");
-
-  tampilkan("Sensor 1", sensor1);
-  tampilkan("Sensor 2", sensor2);
-  tampilkan("Sensor 3", sensor3);
-  tampilkan("Sensor 4", sensor4);
-
-  Serial.println();
-
-  delay(500);
+                    if (targetAngle2 != currentAngle2) {
+                        currentAngle2 = targetAngle2;
+                        servo2.write(currentAngle2);
+                        Serial.print("Servo 2 -> ");
+                        Serial.println(currentAngle2);
+                    }
+                } else {
+                    Serial.print("Gagal parsing JSON: ");
+                    Serial.println(error.c_str());
+                }
+            } else {
+                Serial.print("Error HTTP: ");
+                Serial.println(httpResponseCode);
+            }
+            
+            http.end(); 
+        } else {
+            Serial.println("WiFi Terputus, mencoba menghubungkan ulang...");
+            WiFi.reconnect();
+        }
+    }
 }
